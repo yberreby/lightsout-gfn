@@ -4,4 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "flax>=0.10.4",
+    "jax[cuda12]==0.5.2",
+    "matplotlib>=3.10.1",
+    "mlflow>=2.21.3",
+    "numpy>=2.2.4",
+    "tqdm>=4.67.1",
+]
