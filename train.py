@@ -55,13 +55,15 @@ def main():
         pb_rngs = nnx.Rngs(params=pb_key)
         pf_model = PolicyNet(
             in_dim=config.FLAT_DIM,
-            hidden_dim=config.HIDDEN_DIM,
+            hidden_dim_1=config.HIDDEN_DIM_1,
+            hidden_dim_2=config.HIDDEN_DIM_2,
             out_dim=config.ACTION_DIM,
             rngs=pf_rngs,
         )
         pb_model = PolicyNet(
             in_dim=config.FLAT_DIM,
-            hidden_dim=config.HIDDEN_DIM,
+            hidden_dim_1=config.HIDDEN_DIM_1,
+            hidden_dim_2=config.HIDDEN_DIM_2,
             out_dim=config.ACTION_DIM,
             rngs=pb_rngs,
         )

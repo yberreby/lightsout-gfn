@@ -1,7 +1,7 @@
 import math
 from typing import List
 
-N: int = 3
+N: int = 5
 FLAT_DIM: int = N * N
 ACTION_DIM: int = FLAT_DIM
 MAX_TRAJECTORY_LEN: int = N * N + 10 # e.g., 19 for N=3
@@ -13,7 +13,8 @@ MIN_REWARD_LOG: float = -15.0
 MIN_REWARD: float = math.exp(MIN_REWARD_LOG) # Automatically calculated
 
 # --- Model & Training Config ---
-HIDDEN_DIM: int = 256
+HIDDEN_DIM_1: int = 64
+HIDDEN_DIM_2: int = 256
 LR: float = 1e-3
 WEIGHT_DECAY: float = 1e-2
 WARMUP_STEPS: int = 1000

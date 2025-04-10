@@ -58,7 +58,7 @@ def generate_all_boards(n: int = config.N) -> np.ndarray:
     ):
         dim = n * n
         num_states = 2**dim
-        if num_states > 1_000_000:
+        if num_states > (2**25)+1:
             raise MemoryError(
                 f"Attempting to generate {num_states} states for N={n}, too large."
             )
@@ -249,6 +249,7 @@ def greedy_solve_board(container, start_board):
     return sf, sr
 
 
+# FIXME: prohibitive for large grids!
 @partial(nnx.jit)
 def evaluate_on_all_states(container):
     n = config.N
