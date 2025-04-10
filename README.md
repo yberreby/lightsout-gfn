@@ -6,7 +6,10 @@ Experiment tracking with [MLFlow](https://mlflow.org/).
 
 Dependencies managed with [`uv`](https://docs.astral.sh/uv/).
 
-You can run the code with `uv run -m main`.
+- **Train**: `uv run -m train`.
+- **Monitor**: `uv run mlflow server --host 127.0.0.1 --port 8080`
+- **Infer** (with a GUI / to GIF): `uv run -m infer ./some_checkpoint.ckpt`.
+  - e.g. `./ckpt/31ce2ee8e1984ebf8b4eb7352bde4585/final.ckpt` (depends on run ID)
 
 ## Why?
 
@@ -19,7 +22,7 @@ This is a small pilot experiment, cobbled together quickly. Feel free to tell me
 Expect convergence in under a minute on a RTX 4060 laptop GPU.
 
 ```
-❯ uv run -m main
+❯ uv run -m train
 Generated 512 unique board states for N=3.
 MLflow Run ID: 4c471d5009c2447b890639de4798ee81
 Initializing NNX models...

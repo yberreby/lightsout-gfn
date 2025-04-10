@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from functools import partial
-from typing import Dict, Tuple, List
 from flax import nnx
 
 import config
@@ -12,347 +12,354 @@ class TrainableStateContainer(nnx.Module):
     pb_model: PolicyNet
     z_param: nnx.Param
 
-@jax.jit
-def get_neighbors(index: int) -> jnp.ndarray:
-    row, col = jnp.divmod(index, config.N)
-    rel_pos = jnp.array([[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]])
-    pos = jnp.stack([row, col])[None, :] + rel_pos
-    pos = jnp.clip(pos, 0, config.N - 1)
-    return (pos[:, 0] * config.N + pos[:, 1]).astype(jnp.int32)
+    def __init__(
+        self, pf_model: PolicyNet, pb_model: PolicyNet, z_param: nnx.Param
+    ):
+        self.pf_model = pf_model
+        self.pb_model = pb_model
+        self.z_param = z_param
+
+
+@partial(jax.jit, static_argnames=("n",))
+def get_neighbors(index: int, n: int) -> jnp.ndarray:
+    row, col = jnp.divmod(index, n)
+    rel_pos = jnp.array(
+        [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]], dtype=jnp.int32
+    )
+    abs_rows = row + rel_pos[:, 0]
+    abs_cols = col + rel_pos[:, 1]
+    clipped_rows = jnp.clip(abs_rows, 0, n - 1)
+    clipped_cols = jnp.clip(abs_cols, 0, n - 1)
+    neighbor_indices = (clipped_rows * n + clipped_cols).astype(jnp.int32)
+    return neighbor_indices
 
 
 @jax.jit
 def toggle_tile(board: jnp.ndarray, action_idx: int) -> jnp.ndarray:
-    return board.at[get_neighbors(action_idx)].add(1) % 2
+    n = config.N
+    action_idx = jnp.asarray(action_idx, dtype=jnp.int32)
+    affected_indices = get_neighbors(action_idx, n)
+    updates = jnp.zeros_like(board, dtype=jnp.int8).at[affected_indices].set(
+        1, mode='promise_in_bounds'
+    )
+    return jnp.bitwise_xor(board.astype(jnp.int8), updates)
 
 
 @jax.jit
-def is_solved(board: jnp.ndarray) -> bool:
-    return jnp.all(board == 0, axis=-1)
+def is_solved(board: jnp.ndarray) -> jnp.ndarray:
+    return jnp.all(board == 0)
 
 
-# FIXME: Terrible for bigger than 3x3.
-def generate_all_boards(n: int) -> jnp.ndarray:
-    dim = n * n
-    num_states = 2**dim
-    all_boards = []
-    for i in range(num_states):
-        binary_repr = bin(i)[2:].zfill(dim)
-        board = jnp.array([int(bit) for bit in binary_repr], dtype=jnp.int8)
-        all_boards.append(board)
-    return jnp.stack(all_boards)
+def generate_all_boards(n: int = config.N) -> np.ndarray:
+    if (
+        not hasattr(generate_all_boards, "cache")
+        or generate_all_boards.cache is None
+        or generate_all_boards.cache_n != n
+    ):
+        dim = n * n
+        num_states = 2**dim
+        if num_states > 1_000_000:
+            raise MemoryError(
+                f"Attempting to generate {num_states} states for N={n}, too large."
+            )
+        print(f"Generated {num_states} boards for N={n}.")
+        indices = np.arange(num_states, dtype=np.uint32)
+        powers_of_2 = (2 ** np.arange(dim, dtype=np.uint32)).astype(np.uint32)
+        all_boards_np = ((indices[:, None] & powers_of_2) != 0).astype(np.int8)
+        generate_all_boards.cache = all_boards_np
+        generate_all_boards.cache_n = n
+    return generate_all_boards.cache
+
+generate_all_boards.cache = None
+generate_all_boards.cache_n = -1
 
 
-@partial(jax.jit, static_argnames=["n"])
-def _get_neighbors_eval(index: int, n: int) -> jnp.ndarray:
-    row, col = jnp.divmod(index, n)
-    rel_pos = jnp.array([[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]])
-    pos = jnp.stack([row, col])[None, :] + rel_pos
-    pos = jnp.clip(pos, 0, n - 1)
-    return (pos[:, 0] * n + pos[:, 1]).astype(jnp.int32)
-
-
-@partial(jax.jit, static_argnames=["n"])
-def _toggle_tile_eval(board: jnp.ndarray, action_idx: int, n: int) -> jnp.ndarray:
-    neighbor_indices = _get_neighbors_eval(action_idx, n)
-    return board.at[neighbor_indices].add(1) % 2
-
-
-@partial(jax.jit, static_argnames=["n", "n_actions"])
+@partial(jax.jit, static_argnames=("n", "n_actions"))
 def apply_k_random_actions_eval(
-    key: jnp.ndarray, n_actions: int, n: int
+    key, n_actions, n=config.N
 ) -> jnp.ndarray:
-    flat_dim = config.FLAT_DIM
-    action_dim = config.ACTION_DIM
+    flat_dim = n * n
     start_board = jnp.zeros((flat_dim,), dtype=jnp.int8)
-    actions_to_apply = jax.random.randint(key, (n_actions,), 0, action_dim)
-    _toggle_tile_static_n = partial(_toggle_tile_eval, n=n)
-    final_board, _ = jax.lax.scan(
-        lambda board, action: (_toggle_tile_static_n(board, action), None),
-        start_board,
-        actions_to_apply,
-    )
-    return final_board.astype(jnp.int8)
+    actions = jax.random.randint(key, (n_actions,), 0, flat_dim)
+    def scan_step(bs, a):
+        return toggle_tile(bs, a), None
+    final, _ = jax.lax.scan(scan_step, start_board, actions)
+    return final.astype(jnp.int8)
 
 
 @partial(nnx.jit)
-def sample_trajectory(
-    key: jnp.ndarray, container: TrainableStateContainer, start_board: jnp.ndarray
-) -> Tuple[
-    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
-]:
+def sample_trajectory(key, container, start_board):
     max_traj_len = config.MAX_TRAJECTORY_LEN
-    max_theo_steps = config.MAX_THEORETICAL_STEPS
     pf_model = container.pf_model
 
     @nnx.jit
-    def _sample_action_mlp(
-        key: jnp.ndarray, board: jnp.ndarray
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        logits = pf_model(board)
-        valid_action_mask = jnp.where(is_solved(board), -jnp.inf, 0.0)
-        masked_logits = logits + valid_action_mask
+    def _sample_action_mlp(key, board):
+        logits = pf_model(board.astype(jnp.float32))
+        valid_mask = jnp.where(is_solved(board), -jnp.inf, 0.0)
+        masked_logits = logits + valid_mask
         action = jax.random.categorical(key, masked_logits)
         log_prob = jax.nn.log_softmax(masked_logits)[action]
         return action.astype(jnp.int32), log_prob.astype(jnp.float32)
 
     def step_fn(carry, _):
-        key, current_board, solved_flag = carry
-        action_key, next_key = jax.random.split(key)
-        state_before_action = current_board
-        action_ns, logp_ns = _sample_action_mlp(action_key, current_board)
-        no_op_action, no_op_logp = jnp.int32(-1), jnp.float32(0.0)
-        action, pf_log_prob = jax.lax.cond(
-            solved_flag,
-            lambda: (no_op_action, no_op_logp),
-            lambda: (action_ns, logp_ns),
+        key, cb, solved = carry
+        ak, nk = jax.random.split(key)
+        state_before = cb
+        a_ns, lp_ns = _sample_action_mlp(ak, cb)
+        noop_a, noop_lp = jnp.int32(-1), jnp.float32(0.0)
+        a, pf_lp = jax.lax.cond(
+            solved, lambda: (noop_a, noop_lp), lambda: (a_ns, lp_ns)
         )
-        next_board = jax.lax.cond(
-            action == no_op_action,
-            lambda b: b,
-            lambda b: toggle_tile(b, action),
-            current_board,
+        nb = jax.lax.cond(
+            a == noop_a, lambda b: b, lambda b: toggle_tile(b, a), cb
         ).astype(jnp.int8)
-        next_solved_flag = jnp.logical_or(solved_flag, is_solved(next_board))
-        step_output = (state_before_action, action, pf_log_prob)
-        next_carry = (next_key, next_board, next_solved_flag)
-        return next_carry, step_output
+        next_s = jnp.logical_or(solved, is_solved(nb))
+        return (nk, nb, next_s), (state_before, a, pf_lp)
 
     init_carry = (key, start_board.astype(jnp.int8), is_solved(start_board))
     _, (states_before, actions, pf_log_probs) = jax.lax.scan(
         step_fn, init_carry, None, length=max_traj_len
     )
 
-    def get_next_state(board, action):
-        next_b = jax.lax.cond(
-            action == -1, lambda b: b, lambda b: toggle_tile(b, action), board
-        )
-        return next_b, next_b
+    def get_next(b, a):
+        nb = jax.lax.cond(a == -1, lambda x: x, lambda x: toggle_tile(x, a), b)
+        return nb, nb
 
-    _, all_states_post_action = jax.lax.scan(get_next_state, start_board, actions)
-    full_states_trajectory = jnp.concatenate(
-        [start_board[None, :], all_states_post_action], axis=0
-    ).astype(jnp.int8)
-    solved_mask_trajectory = jax.vmap(is_solved)(full_states_trajectory)
-    first_solved_state_idx = jnp.argmax(solved_mask_trajectory)
-    was_solved = jnp.any(solved_mask_trajectory)
-    solved_steps = jax.lax.cond(
-        was_solved, lambda idx: idx, lambda idx: max_traj_len, first_solved_state_idx
+    _, states_after_scan = jax.lax.scan(get_next, start_board, actions)
+    full_states_traj = jnp.concatenate(
+        [start_board[None, :], states_after_scan], axis=0
+    ).astype(
+        jnp.int8
     )
+    solved_mask_traj = jax.vmap(is_solved)(full_states_traj)
+    first_solved_idx = jnp.argmax(solved_mask_traj)
+    was_solved = jnp.any(solved_mask_traj)
+    solved_steps = jnp.where(was_solved, first_solved_idx, max_traj_len)
     solved_steps = jnp.minimum(solved_steps, max_traj_len)
     mask = jnp.arange(max_traj_len) < solved_steps
     log_reward = jax.lax.cond(
         was_solved,
-        lambda s: config.REWARD_EXP_MULTIPLIER
-        * (max_theo_steps - s.astype(jnp.float32)),
+        lambda s: -jnp.log(
+            1.0 + config.REWARD_INV_STEPS_C * s.astype(jnp.float32)
+        ),
         lambda s: jnp.float32(config.MIN_REWARD_LOG),
         solved_steps,
-    )
-    return full_states_trajectory, actions, pf_log_probs, log_reward, mask, solved_steps
+    ).astype(jnp.float32)
+
+    return full_states_traj, actions, pf_log_probs, log_reward, mask, solved_steps
 
 
-def batch_sample_trajectories(
-    key: jnp.ndarray, container: TrainableStateContainer, start_boards: jnp.ndarray
-) -> Tuple[
-    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
-]:
+def batch_sample_trajectories(key, container, start_boards):
     keys = jax.random.split(key, start_boards.shape[0])
-    batch_fn = jax.vmap(sample_trajectory, in_axes=(0, None, 0))
-    return batch_fn(keys, container, start_boards)
+    start_boards_jax = jnp.asarray(start_boards)
+    return jax.vmap(sample_trajectory, in_axes=(0, None, 0))(
+        keys, container, start_boards_jax
+    )
+
 
 @partial(nnx.jit)
-def compute_tb_loss(
-    container: TrainableStateContainer, batch_data: Tuple
-) -> jnp.ndarray:
-    pf_model = container.pf_model
-    pb_model = container.pb_model
-    z_param = container.z_param
-
-    states, actions, _, log_rewards, masks, _ = batch_data
-    B, T_plus_1, F = states.shape
+def compute_tb_loss(container, batch_data):
+    pf = container.pf_model
+    pb = container.pb_model
+    z = container.z_param.value
+    s, a, _, r, m, _ = batch_data
     T = config.MAX_TRAJECTORY_LEN
-    action_dim = config.ACTION_DIM
+    ad = config.ACTION_DIM
 
     @nnx.jit
-    def get_log_probs(
-        model: PolicyNet,
-        input_states: jnp.ndarray,
-        actions_taken: jnp.ndarray,
-        masks: jnp.ndarray,
-    ) -> jnp.ndarray:
-        B_in, T_slice, F_in = input_states.shape
-        input_states_flat = input_states.reshape(B_in * T_slice, F_in)
-        logits = model(input_states_flat)
-        logits = logits.reshape(B_in, T_slice, action_dim)
-        all_log_probs = jax.nn.log_softmax(logits, axis=-1)
-        log_probs_taken = jnp.take_along_axis(
-            all_log_probs, actions_taken[:, :, None], axis=2
+    def get_lp(model, states, actions, masks):
+        B, T_s, _ = states.shape
+        logits = model(states.reshape(B * T_s, -1).astype(jnp.float32)).reshape(
+            B, T_s, ad
+        )
+        lp = jnp.take_along_axis(
+            jax.nn.log_softmax(logits, -1), actions[:, :, None], 2
         ).squeeze(-1)
-        return jnp.sum(log_probs_taken * masks, axis=1)
+        return jnp.sum(lp * masks, axis=1)
 
-    sum_pf_log_probs = get_log_probs(pf_model, states[:, :T, :], actions, masks)
-    sum_pb_log_probs = get_log_probs(pb_model, states[:, 1 : T + 1, :], actions, masks)
-
-    z_param_casted, sum_pf_log_probs, log_rewards, sum_pb_log_probs = jax.tree.map(
-        lambda x: x.astype(jnp.float32),
-        (z_param, sum_pf_log_probs, log_rewards, sum_pb_log_probs),
+    pf_lp = get_lp(pf, s[:, :T, :], a, m)
+    pb_lp = get_lp(pb, s[:, 1 : T + 1, :], a, m)
+    z_f, pf_f, r_f, pb_f = jax.tree.map(
+        lambda x: x.astype(jnp.float32), (z, pf_lp, r, pb_lp)
     )
-    tb_terms = z_param_casted + sum_pf_log_probs - log_rewards - sum_pb_log_probs
-    loss = jnp.mean(tb_terms**2)
+    loss = jnp.mean((z_f + pf_f - r_f - pb_f) ** 2)
     return loss
 
 
 @partial(nnx.jit, static_argnames=("all_boards_shape",))
-def train_step(
-    container: TrainableStateContainer,
-    optimizer: nnx.Optimizer,
-    key: jnp.ndarray,
-    all_boards: jnp.ndarray,
-    all_boards_shape: Tuple,
-) -> Tuple[Dict, jnp.ndarray]:
-    num_all_boards = all_boards_shape[0]
-    board_key, sample_key, next_key = jax.random.split(key, 3)
-
-    board_indices = jax.random.choice(
-        board_key, num_all_boards, shape=(config.BATCH_SIZE,), replace=True
+def train_step(container, optimizer, key, all_boards, all_boards_shape):
+    num_b = all_boards_shape[0]
+    bk, sk, nk = jax.random.split(key, 3)
+    idx = jax.random.choice(
+        bk, num_b, shape=(config.BATCH_SIZE,), replace=True
     )
-    start_boards = all_boards[board_indices]
-    batch_data = batch_sample_trajectories(sample_key, container, start_boards)
-
-    def loss_fn(container_arg: TrainableStateContainer):
-        return compute_tb_loss(container_arg, batch_data)
-
-    # Calculate gradients w.r.t the container module
-    loss_val, grads = nnx.value_and_grad(loss_fn)(container)
-
-    # Apply gradients using the optimizer.
-    # This updates the state of 'container' and 'optimizer' passed as arguments implicitly.
-    optimizer.update(grads)
-
-    loss_is_finite = jnp.isfinite(loss_val)
-    # If loss is not finite, the updates might have still happened with NaNs.
-    # Optax often includes checks, but relying on that implicitly isn't robust.
-    # For simplicity matching the tutorial, we don't explicitly prevent the update here,
-    # but we report the flag. The main loop should check this flag.
-
-    # Extract metrics
-    _, _, _, log_rewards, _, solved_steps = batch_data
-    max_traj_len = config.MAX_TRAJECTORY_LEN
-    solved_mask = solved_steps < max_traj_len
-    solved_count = jnp.sum(solved_mask)
-    solved_pct = jnp.mean(solved_mask) * 100
-    avg_steps_solved = jnp.sum(jnp.where(solved_mask, solved_steps, 0)) / jnp.maximum(
-        1e-6, solved_count
-    )
-    reported_avg_steps = jnp.where(
-        solved_count > 0, avg_steps_solved, max_traj_len
-    ).astype(float)
-
-    metrics = {
-        "loss": loss_val,
-        "solved_pct": solved_pct,
-        "avg_steps_solved": reported_avg_steps,
-        "avg_log_reward": jnp.mean(log_rewards),
-        "loss_finite": loss_is_finite,
+    sb = all_boards[idx]
+    batch = batch_sample_trajectories(sk, container, sb)
+    lv, gr = nnx.value_and_grad(lambda c: compute_tb_loss(c, batch))(container)
+    optimizer.update(gr)
+    lf = jnp.isfinite(lv)
+    _, _, _, lr, _, ss = batch
+    T = config.MAX_TRAJECTORY_LEN
+    sm = ss < T
+    sc = jnp.sum(sm)
+    sp = jnp.mean(sm) * 100.0
+    avs = jnp.sum(jnp.where(sm, ss, 0)) / jnp.maximum(1e-9, sc)
+    rs = jnp.where(sc > 0, avs, T).astype(float)
+    mets = {
+        "loss": lv,
+        "solved_pct": sp,
+        "avg_steps_solved": rs,
+        "avg_log_reward": jnp.mean(lr),
+        "loss_finite": lf,
     }
-
-    return metrics, next_key
+    return mets, nk
 
 
 @partial(nnx.jit)
-def greedy_solve_board(
-    container: TrainableStateContainer, start_board: jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def greedy_solve_board(container, start_board):
     eval_max_steps = config.EVAL_MAX_STEPS
-    start_solved = is_solved(start_board)
-    pf_model = container.pf_model
-    init_carry = (
-        start_board.astype(jnp.int8),
-        start_solved,
+    start_s = is_solved(start_board)
+    pf = container.pf_model
+    init = (
+        jnp.asarray(start_board, dtype=jnp.int8),
+        start_s,
         jnp.int32(eval_max_steps + 1),
         jnp.int32(0),
     )
 
-    def step_fn(carry, _):
-        current_board, already_solved, solve_step_found, step_idx = carry
-
-        def select_action_branch():
-            logits = pf_model(current_board)
-            return jnp.argmax(logits).astype(jnp.int32)
-
-        action = jax.lax.cond(
-            already_solved, lambda: jnp.int32(-1), select_action_branch
+    def step(c, _):
+        cb, s, fs, i = c
+        a = jax.lax.cond(
+            s,
+            lambda: -1,
+            lambda: jnp.argmax(pf(cb.astype(jnp.float32))).astype(jnp.int32),
         )
-        next_board = jax.lax.cond(
-            already_solved,
-            lambda: current_board,
-            lambda: toggle_tile(current_board, action),
+        nb = jax.lax.cond(
+            a == -1, lambda: cb, lambda: toggle_tile(cb, a)
         ).astype(jnp.int8)
-        currently_solved = is_solved(next_board)
-        newly_solved_this_step = jnp.logical_and(
-            currently_solved, jnp.logical_not(already_solved)
-        )
-        current_step_val = step_idx + 1
-        next_solve_step_found = jnp.where(
-            newly_solved_this_step, current_step_val, solve_step_found
-        )
-        next_already_solved = jnp.logical_or(already_solved, currently_solved)
-        next_carry = (
-            next_board,
-            next_already_solved,
-            next_solve_step_found,
-            step_idx + 1,
-        )
-        return next_carry, None
+        cs = is_solved(nb)
+        nly = jnp.logical_and(cs, ~s)
+        nf = jnp.where(nly, i + 1, fs)
+        ns = jnp.logical_or(s, cs)
+        return (nb, ns, nf, i + 1), None
 
-    final_carry, _ = jax.lax.scan(step_fn, init_carry, None, length=eval_max_steps)
-    final_first_solve_step = final_carry[2]
-    solved_step = jnp.where(start_solved, 0, final_first_solve_step).astype(jnp.int32)
-    solved_flag_final = solved_step <= eval_max_steps
-    return solved_flag_final, solved_step
+    final, _ = jax.lax.scan(step, init, None, length=eval_max_steps)
+    sr = jnp.where(start_s, 0, final[2]).astype(jnp.int32)
+    sf = sr <= eval_max_steps
+    return sf, sr
 
 
-def evaluate(
-    container: TrainableStateContainer,
-    k_values: List[int],
-    num_samples_per_k: int,
-    eval_key: jnp.ndarray,
-) -> Tuple[Dict, jnp.ndarray]:
-    all_metrics = {}
-    total_solved = 0
-    total_samples = 0
+@partial(nnx.jit)
+def evaluate_on_all_states(container):
     n = config.N
-    _vmap_apply_k_eval = jax.vmap(
+    all_b_np = generate_all_boards(n)
+    all_b = jnp.asarray(all_b_np)
+    total_b = all_b.shape[0]
+    if total_b == 0:
+        return {"eval_all_states_greedy_solved_pct": jnp.array(0.0)}
+    flags, _ = jax.vmap(greedy_solve_board, in_axes=(None, 0))(
+        container, all_b
+    )
+    acc = jnp.mean(flags) * 100.0
+    return {"eval_all_states_greedy_solved_pct": acc}
+
+
+@partial(nnx.jit)
+def stochastic_solve_board(key, container, start_board):
+    eval_max_steps = config.EVAL_MAX_STEPS
+    start_s = is_solved(start_board)
+    pf = container.pf_model
+    init = (
+        key,
+        jnp.asarray(start_board, dtype=jnp.int8),
+        start_s,
+        jnp.int32(eval_max_steps + 1),
+        jnp.int32(0),
+    )
+
+    def step(c, _):
+        k, cb, s, fs, i = c
+        sk, nk = jax.random.split(k)
+        a = jax.lax.cond(
+            s,
+            lambda k_: -1,
+            lambda k_: jax.random.categorical(
+                k_, pf(cb.astype(jnp.float32))
+            ).astype(jnp.int32),
+            sk,
+        )
+        nb = jax.lax.cond(
+            a == -1, lambda: cb, lambda: toggle_tile(cb, a)
+        ).astype(jnp.int8)
+        cs = is_solved(nb)
+        nly = jnp.logical_and(cs, ~s)
+        nf = jnp.where(nly, i + 1, fs)
+        ns = jnp.logical_or(s, cs)
+        return (nk, nb, ns, nf, i + 1), None
+
+    final, _ = jax.lax.scan(step, init, None, length=eval_max_steps)
+    sr = jnp.where(start_s, 0, final[3]).astype(jnp.int32)
+    sf = sr <= eval_max_steps
+    return sf, sr
+
+
+def evaluate_stochastically_on_all_states(
+    key, container, num_stochastic_runs
+):
+    n = config.N
+    all_b_np = generate_all_boards(n)
+    all_b = jnp.asarray(all_b_np)
+    total_b = all_b.shape[0]
+    mname = f"eval_all_states_stochastic{num_stochastic_runs}_solved_pct"
+    if total_b == 0:
+        return {mname: jnp.array(0.0)}
+    keys = jax.random.split(key, total_b * num_stochastic_runs).reshape(
+        (total_b, num_stochastic_runs, 2)
+    )
+    vmap_runs = jax.vmap(stochastic_solve_board, in_axes=(0, None, None))
+    vmap_boards = jax.vmap(vmap_runs, in_axes=(0, None, 0))
+    flags, _ = vmap_boards(keys, container, all_b)
+    acc = jnp.mean(jnp.any(flags, axis=1)) * 100.0
+    return {mname: acc}
+
+
+def evaluate(container, k_values, num_samples_per_k, eval_key):
+    all_metrics = {}
+    total_solved_overall = 0
+    total_samples_overall = 0
+    n = config.N
+    v_apply_k = jax.vmap(
         partial(apply_k_random_actions_eval, n=n), in_axes=(0, None)
     )
-    _vmap_greedy_solve = jax.vmap(
-        greedy_solve_board, in_axes=(None, 0)
-    )  # Pass container via None
+    v_greedy = jax.vmap(greedy_solve_board, in_axes=(None, 0))
 
     for k in k_values:
         k_key, eval_key = jax.random.split(eval_key)
-        eval_board_keys = jax.random.split(k_key, num_samples_per_k)
-        eval_boards = _vmap_apply_k_eval(eval_board_keys, k)
-        initial_unsolved_mask = ~is_solved(eval_boards)
-        num_trivial = num_samples_per_k - jnp.sum(initial_unsolved_mask)
-        solved_flags, solve_steps = _vmap_greedy_solve(
-            container, eval_boards
-        )  # Pass container
-        solved_non_trivial_mask = jnp.logical_and(initial_unsolved_mask, solved_flags)
-        solved_count_k = jnp.sum(solved_non_trivial_mask)
-        total_solved_k_incl_trivial = solved_count_k + num_trivial
-        eval_solved_pct_k = (total_solved_k_incl_trivial / num_samples_per_k) * 100.0
-        sum_steps_k = jnp.sum(jnp.where(solved_non_trivial_mask, solve_steps, 0))
-        avg_steps_k = jnp.where(
-            solved_count_k > 0, sum_steps_k / solved_count_k, config.EVAL_MAX_STEPS + 1
-        ).astype(float)
-        all_metrics[f"eval_solved_pct_k{k}"] = float(eval_solved_pct_k)
-        all_metrics[f"eval_avg_steps_k{k}"] = float(avg_steps_k)
-        total_solved += total_solved_k_incl_trivial
-        total_samples += num_samples_per_k
+        b_keys = jax.random.split(k_key, num_samples_per_k)
+        boards = v_apply_k(b_keys, k)
+        jax.block_until_ready(boards)
+        flags, steps = v_greedy(container, boards)
+        jax.block_until_ready(flags)
 
-    overall_solved_pct = (
-        (total_solved / total_samples * 100.0) if total_samples > 0 else 0.0
+        num_solved_k = jnp.sum(flags).item()
+        pct_k = (num_solved_k / num_samples_per_k) * 100.0
+        sum_steps = jnp.sum(jnp.where(flags, steps, 0)).item()
+
+        avg_steps = (
+            (sum_steps / max(1e-9, num_solved_k))
+            if num_solved_k > 0
+            else (config.EVAL_MAX_STEPS + 1)
+        )
+
+        all_metrics[f"eval_solved_pct_k{k}"] = float(pct_k)
+        all_metrics[f"eval_avg_steps_k{k}"] = float(avg_steps)
+        total_solved_overall += num_solved_k
+        total_samples_overall += num_samples_per_k
+
+    overall_pct = (
+        (total_solved_overall / total_samples_overall * 100.0)
+        if total_samples_overall > 0
+        else 0.0
     )
-    all_metrics["eval_solved_pct_overall"] = overall_solved_pct
+    all_metrics["eval_k_perturb_solved_pct_overall"] = overall_pct
     return all_metrics, eval_key
