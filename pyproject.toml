@@ -1,7 +1,7 @@
 [project]
 name = "lightsout-gfn"
 version = "0.1.0"
-description = "Add your description here"
+description = "Solving 'Lights Out!' with Generative Flow Networks (GFlowNets)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
