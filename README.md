@@ -2,14 +2,17 @@
 
 Experimental [JAX](https://docs.jax.dev/en/latest/) (with [NNX](https://flax.readthedocs.io/en/v0.8.3/experimental/nnx/index.html)) codebase using [GFlowNets](https://milayb.notion.site/The-GFlowNet-Tutorial-95434ef0e2d94c24aab90e69b30be9b3) to solve 3x3 [LightsOut](https://link.springer.com/chapter/10.1007/978-3-642-40273-9_13) puzzles.
 
+<img src="./demo.gif" alt="Demo">
+
+_Demo generated with `infer.py`_
+
 Experiment tracking with [MLFlow](https://mlflow.org/).
 
 Dependencies managed with [`uv`](https://docs.astral.sh/uv/).
 
 - **Train**: `uv run -m train`.
 - **Monitor**: `uv run mlflow server --host 127.0.0.1 --port 8080`
-- **Infer** (with a GUI / to GIF): `uv run -m infer ./some_checkpoint.ckpt`.
-  - e.g. `./ckpt/31ce2ee8e1984ebf8b4eb7352bde4585/final.ckpt` (depends on run ID)
+- **Infer** (with a GUI / to GIF): `uv run -m infer ./some_checkpoint`
 
 ## Why?
 
