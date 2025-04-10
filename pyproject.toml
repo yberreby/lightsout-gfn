@@ -10,5 +10,10 @@ dependencies = [
     "matplotlib>=3.10.1",
     "mlflow>=2.21.3",
     "numpy>=2.2.4",
+    "orbax-checkpoint>=0.6.4",
+    "pyqt6>=6.9.0",
     "tqdm>=4.67.1",
 ]
+
+[tool.uv.sources]
+orbax-checkpoint = { git = "https://github.com/google/orbax/", subdirectory = "checkpoint" }
